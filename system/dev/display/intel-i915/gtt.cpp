@@ -53,13 +53,9 @@ zx_status_t Gtt::Init(Controller* controller) {
         zxlogf(ERROR, "i915: failed to alloc scratch buffer %d\n", status);
         return status;
     }
-    status = scratch_buffer_.op_range(ZX_VMO_OP_COMMIT, 0, PAGE_SIZE, nullptr, 0);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "i915: failed to commit scratch buffer %d\n", status);
-        return status;
-    }
-    status = scratch_buffer_.op_range(ZX_VMO_OP_LOOKUP, 0, PAGE_SIZE,
-                                      &scratch_buffer_paddr_, sizeof(zx_paddr_t));
+
+    status = controller_->bti().pin(ZX_BTI_PERM_READ, scratch_buffer_, 0, PAGE_SIZE,
+                                    &scratch_buffer_paddr_, 1);
     if (status != ZX_OK) {
         zxlogf(ERROR, "i915: failed to look up scratch buffer %d\n", status);
         return status;
@@ -93,14 +89,17 @@ fbl::unique_ptr<const GttRegion> Gtt::Insert(zx::vmo* buffer,
     uint32_t pte_idx = static_cast<uint32_t>(r->base / PAGE_SIZE);
 
     uint32_t num_pages = ROUNDUP(length, PAGE_SIZE) / PAGE_SIZE;
-    while (i < num_pages) {
+    for (unsigned i = 0; i < num_pages; i += num_entries) {
         uint32_t cur_len = fbl::min(length - (i * PAGE_SIZE), num_entries * PAGE_SIZE);
-        status = buffer->op_range(ZX_VMO_OP_LOOKUP, i * PAGE_SIZE, cur_len, paddrs, PAGE_SIZE);
+        size_t size = ROUNDUP(cur_len, PAGE_SIZE);
+        size_t actual_entries = size / PAGE_SIZE;
+        status = controller_->bti().pin(ZX_BTI_PERM_READ, *buffer, i * PAGE_SIZE,
+                                        size, paddrs, actual_entries);
         if (status != ZX_OK) {
-            zxlogf(SPEW, "i915: Failed to get paddrs (%d)\n", status);
+            zxlogf(ERROR, "i915: Failed to get paddrs (%d)\n", status);
             return nullptr;
         }
-        for (unsigned j = 0; j < num_entries && i < num_pages; i++, j++) {
+        for (unsigned j = 0; j < actual_entries; j++) {
             uint64_t pte = gen_pte_encode(paddrs[j], true);
             controller_->mmio_space()->Write<uint64_t>(get_pte_offset(pte_idx++), pte);
         }

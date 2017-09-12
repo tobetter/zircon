@@ -1102,6 +1102,11 @@ irq_configured:
         zxlogf(ERROR, "nvme: cannot enable bus mastering\n");
         goto fail;
     }
+    zx_handle_t bti;
+    if (pci_get_bti(&nvme->pci, 0, &bti) != ZX_OK) {
+        goto fail;
+    }
+    io_buffer_set_default_bti(bti);
 
     device_add_args_t args = {
         .version = DEVICE_ADD_ARGS_VERSION,

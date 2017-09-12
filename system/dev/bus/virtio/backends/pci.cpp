@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <ddk/debug.h>
+#include <ddk/io-buffer.h>
 #include <ddk/protocol/pci.h>
 #include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
@@ -28,6 +29,13 @@ zx_status_t PciBackend::Bind() {
         zxlogf(ERROR, "%s: cannot enable bus master %d\n", tag(), st);
         return st;
     }
+
+    zx_handle_t bti;
+    st = pci_get_bti(&pci_, 0, &bti);
+    if (st != ZX_OK) {
+        return st;
+    }
+    io_buffer_set_default_bti(bti);
 
     // try to set up our IRQ mode
     uint32_t avail_irqs = 0;

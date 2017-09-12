@@ -700,6 +700,12 @@ zx_status_t Controller::Bind(fbl::unique_ptr<i915::Controller>* controller_ptr) 
         }
     }
 
+    status = pci_get_bti(&pci_, 0, bti_.reset_and_get_address());
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "i915: failed to get bti: %d\n", status);
+        return status;
+    }
+
     zxlogf(TRACE, "i915: mapping registers\n");
     // map register window
     uintptr_t regs;

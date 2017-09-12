@@ -214,7 +214,7 @@ static inline void xhci_cache_flush_invalidate(volatile const void* addr, size_t
 }
 #endif
 
-zx_status_t xhci_init(xhci_t* xhci, xhci_mode_t mode, uint32_t num_interrupts);
+zx_status_t xhci_init(xhci_t* xhci, xhci_mode_t mode, uint32_t num_interrupts, zx_handle_t bti);
 // Returns the max number of interrupters supported by the xhci.
 // This is different to xhci->num_interrupts.
 uint32_t xhci_get_max_interrupters(xhci_t* xhci);

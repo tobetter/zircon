@@ -387,6 +387,12 @@ static zx_status_t rtl8111_bind(void* ctx, zx_device_t* dev) {
         goto fail;
     }
 
+    zx_handle_t bti;
+    if ((r = pci_get_bti(&edev->pci, 0, &bti)) != ZX_OK) {
+        return r;
+    }
+    io_buffer_set_default_bti(bti);
+
     uint32_t mac_version = readl(RTL_TCR) & 0x7cf00000;
     zxlogf(TRACE, "rtl8111: version 0x%08x\n", mac_version);
 
