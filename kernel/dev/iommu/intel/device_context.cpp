@@ -6,6 +6,7 @@
 
 #include "device_context.h"
 
+#include <fbl/auto_call.h>
 #include <fbl/unique_ptr.h>
 #include <trace.h>
 #include <vm/vm.h>
@@ -21,14 +22,14 @@ namespace intel_iommu {
 DeviceContext::DeviceContext(uint8_t bus, uint8_t dev_func, uint32_t domain_id, IommuImpl* parent,
                              volatile ds::ExtendedContextEntry* context_entry)
         : parent_(parent), extended_context_entry_(context_entry), second_level_pt_(parent, this),
-          bus_(bus), dev_func_(dev_func), extended_(true),
+          region_alloc_(), bus_(bus), dev_func_(dev_func), extended_(true),
           domain_id_(domain_id) {
 }
 
 DeviceContext::DeviceContext(uint8_t bus, uint8_t dev_func, uint32_t domain_id, IommuImpl* parent,
                              volatile ds::ContextEntry* context_entry)
         : parent_(parent), context_entry_(context_entry), second_level_pt_(parent, this),
-          bus_(bus), dev_func_(dev_func), extended_(false),
+          region_alloc_(), bus_(bus), dev_func_(dev_func), extended_(false),
           domain_id_(domain_id) {
 }
 
@@ -61,6 +62,30 @@ DeviceContext::~DeviceContext() {
     second_level_pt_.Destroy();
 }
 
+zx_status_t DeviceContext::InitCommon() {
+    // TODO(teisenbe): don't hardcode PML4_L
+    DEBUG_ASSERT(parent_->caps()->supports_48_bit_agaw());
+    zx_status_t status = second_level_pt_.Init(PML4_L);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    constexpr size_t kMaxAllocatorMemoryUsage = 16 * PAGE_SIZE;
+    fbl::RefPtr<RegionAllocator::RegionPool> region_pool =
+            RegionAllocator::RegionPool::Create(kMaxAllocatorMemoryUsage);
+    if (region_pool == nullptr) {
+        return ZX_ERR_NO_MEMORY;
+    }
+    region_alloc_.SetRegionPool(fbl::move(region_pool));
+
+    // Start the allocations at 1MB to handle the equivalent of nullptr
+    // dereferences.
+    uint64_t base = 1ull << 20;
+    uint64_t size = aspace_size() - base;
+    region_alloc_.AddRegion({ .base = 1ull << 20, .size = size });
+    return ZX_OK;
+}
+
 zx_status_t DeviceContext::Create(uint8_t bus, uint8_t dev_func, uint32_t domain_id, IommuImpl* parent,
                                   volatile ds::ContextEntry* context_entry,
                                   fbl::unique_ptr<DeviceContext>* device) {
@@ -77,9 +102,7 @@ zx_status_t DeviceContext::Create(uint8_t bus, uint8_t dev_func, uint32_t domain
         return ZX_ERR_NO_MEMORY;
     }
 
-    // TODO(teisenbe): don't hardcode PML4_L
-    DEBUG_ASSERT(parent->caps()->supports_48_bit_agaw());
-    zx_status_t status = dev->second_level_pt_.Init(PML4_L);
+    zx_status_t status = dev->InitCommon();
     if (status != ZX_OK) {
         return status;
     }
@@ -115,8 +138,7 @@ zx_status_t DeviceContext::Create(uint8_t bus, uint8_t dev_func, uint32_t domain
         return ZX_ERR_NO_MEMORY;
     }
 
-    DEBUG_ASSERT(parent->caps()->supports_48_bit_agaw());
-    zx_status_t status = dev->second_level_pt_.Init(PML4_L);
+    zx_status_t status = dev->InitCommon();
     if (status != ZX_OK) {
         return status;
     }
@@ -152,7 +174,6 @@ zx_status_t DeviceContext::SecondLevelMap(const fbl::RefPtr<VmObject>& vmo,
                                           uint64_t offset, size_t size, uint32_t perms,
                                           paddr_t* virt_paddr, size_t* mapped_len) {
     DEBUG_ASSERT(IS_PAGE_ALIGNED(offset));
-    size_t mapped;
     uint flags = 0;
     if (perms & IOMMU_FLAG_PERM_READ) {
         flags |= ARCH_MMU_FLAG_PERM_READ;
@@ -164,6 +185,92 @@ zx_status_t DeviceContext::SecondLevelMap(const fbl::RefPtr<VmObject>& vmo,
         flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
     }
 
+    if (vmo->is_paged()) {
+        return SecondLevelMapPaged(vmo, offset, size, flags, virt_paddr, mapped_len);
+    }
+    return SecondLevelMapPhysical(vmo, offset, size, flags, virt_paddr, mapped_len);
+}
+
+zx_status_t DeviceContext::SecondLevelMapPaged(const fbl::RefPtr<VmObject>& vmo,
+                                               uint64_t offset, size_t size, uint flags,
+                                               paddr_t* virt_paddr, size_t* mapped_len) {
+
+    // Don't try to map more than the min contiguity at a time for now
+    const uint64_t min_contig = minimum_contiguity();
+    if (size > min_contig) {
+        size = min_contig;
+    }
+
+    auto lookup_fn = [](void* ctx, size_t offset, size_t index, paddr_t pa) {
+        paddr_t* paddr = static_cast<paddr_t*>(ctx);
+        paddr[index] = pa;
+        return ZX_OK;
+    };
+
+    fbl::unique_ptr<const RegionAllocator::Region> region;
+    zx_status_t status = region_alloc_.GetRegion(size, min_contig, region);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    // Reserve a spot in the allocated regions list, so the extension can't fail
+    // after we do the map.
+    fbl::AllocChecker ac;
+    allocated_regions_.reserve(allocated_regions_.size() + 1, &ac);
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    paddr_t base = region->base;
+    size_t remaining = size;
+
+    auto cleanup_partial = fbl::MakeAutoCall([&]() {
+        size_t allocated = base - region->base;
+        size_t unmapped;
+        second_level_pt_.UnmapPages(base, allocated / PAGE_SIZE, &unmapped);
+        DEBUG_ASSERT(unmapped == allocated / PAGE_SIZE);
+    });
+
+    while (remaining > 0) {
+        const size_t kNumEntriesPerLookup = 32;
+        size_t chunk_size = fbl::min(remaining, kNumEntriesPerLookup * PAGE_SIZE);
+        paddr_t paddrs[kNumEntriesPerLookup] = {};
+        status = vmo->Lookup(offset, chunk_size, 0, lookup_fn,
+                                         &paddrs);
+        if (status != ZX_OK) {
+            return status;
+        }
+
+        size_t map_len = chunk_size / PAGE_SIZE;
+        size_t mapped;
+        status = second_level_pt_.MapPages(base, paddrs, map_len, flags, &mapped);
+        if (status != ZX_OK) {
+            return status;
+        }
+        ASSERT(mapped == map_len);
+
+        base += chunk_size;
+        remaining -= chunk_size;
+    }
+
+    cleanup_partial.cancel();
+
+    *virt_paddr = region->base;
+    *mapped_len = size;
+
+    allocated_regions_.push_back(fbl::move(region), &ac);
+    // Check shouldn't be able to fail, since we reserved the capacity already
+    ASSERT(ac.check());
+
+    LTRACEF("Map(%02x:%02x.%1x): -> [%p, %p) %#x\n", bus_, (unsigned int)dev_func_ >> 3,
+            (unsigned int)dev_func_ & 0x7, (void*)*virt_paddr, (void*)(*virt_paddr + *mapped_len),
+            flags);
+    return ZX_OK;
+}
+
+zx_status_t DeviceContext::SecondLevelMapPhysical(const fbl::RefPtr<VmObject>& vmo,
+                                                  uint64_t offset, size_t size, uint flags,
+                                                  paddr_t* virt_paddr, size_t* mapped_len) {
     auto lookup_fn = [](void* ctx, size_t offset, size_t index, paddr_t pa) {
         paddr_t* paddr = static_cast<paddr_t*>(ctx);
         *paddr = pa;
@@ -171,33 +278,42 @@ zx_status_t DeviceContext::SecondLevelMap(const fbl::RefPtr<VmObject>& vmo,
     };
 
     paddr_t paddr = UINT64_MAX;
-    zx_status_t status = vmo->Lookup(offset, fbl::min<size_t>(PAGE_SIZE, size), 0, lookup_fn,
+    zx_status_t status = vmo->Lookup(offset, PAGE_SIZE, 0, lookup_fn,
                                      &paddr);
     if (status != ZX_OK) {
         return status;
     }
-    if (paddr == UINT64_MAX) {
-        return ZX_ERR_BAD_STATE;
+    DEBUG_ASSERT(paddr != UINT64_MAX);
+
+    fbl::unique_ptr<const RegionAllocator::Region> region;
+    uint64_t min_contig = minimum_contiguity();
+    status = region_alloc_.GetRegion(size, min_contig, region);
+    if (status != ZX_OK) {
+        return status;
     }
 
-    size_t map_len;
-    if (vmo->is_paged()) {
-        map_len = 1;
-    } else {
-        map_len = ROUNDUP(size, PAGE_SIZE) / PAGE_SIZE;
+    // Reserve a spot in the allocated regions list, so the extension can't fail
+    // after we do the map.
+    fbl::AllocChecker ac;
+    allocated_regions_.reserve(allocated_regions_.size() + 1, &ac);
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
     }
 
-    // TODO(teisenbe): Instead of doing direct mapping, remap to form contiguous
-    // ranges, and handle more than one page at a time in here.
-    status = second_level_pt_.MapPagesContiguous(paddr, paddr, map_len, flags,
-                                                 &mapped);
+    size_t map_len = size / PAGE_SIZE;
+    size_t mapped;
+    status = second_level_pt_.MapPagesContiguous(region->base, paddr, map_len, flags, &mapped);
     if (status != ZX_OK) {
         return status;
     }
     ASSERT(mapped == map_len);
 
-    *virt_paddr = paddr;
+    *virt_paddr = region->base;
     *mapped_len = map_len * PAGE_SIZE;
+
+    allocated_regions_.push_back(fbl::move(region), &ac);
+    // Check shouldn't be able to fail, since we reserved the capacity already
+    ASSERT(ac.check());
 
     LTRACEF("Map(%02x:%02x.%1x): [%p, %p) -> %p %#x\n", bus_, (unsigned int)dev_func_ >> 3,
             (unsigned int)dev_func_ & 0x7, (void*)paddr, (void*)(paddr + PAGE_SIZE), (void*)paddr,
@@ -208,10 +324,36 @@ zx_status_t DeviceContext::SecondLevelMap(const fbl::RefPtr<VmObject>& vmo,
 zx_status_t DeviceContext::SecondLevelUnmap(paddr_t virt_paddr, size_t size) {
     DEBUG_ASSERT(IS_PAGE_ALIGNED(virt_paddr));
     DEBUG_ASSERT(IS_PAGE_ALIGNED(size));
-    size_t unmapped;
-    LTRACEF("Unmap(%02x:%02x.%1x): [%p, %p)\n", bus_, (unsigned int)dev_func_ >> 3,
-            (unsigned int)dev_func_ & 0x7, (void*)virt_paddr, (void*)(virt_paddr + size));
-    return second_level_pt_.UnmapPages(virt_paddr, size / PAGE_SIZE, &unmapped);
+
+    for (size_t i = 0; i < allocated_regions_.size(); ++i) {
+        const auto& region = allocated_regions_[i];
+        if (region->base < virt_paddr || region->base + region->size > virt_paddr + size) {
+            continue;
+        }
+
+        size_t unmapped;
+        LTRACEF("Unmap(%02x:%02x.%1x): [%p, %p)\n", bus_, (unsigned int)dev_func_ >> 3,
+                (unsigned int)dev_func_ & 0x7, (void*)region->base,
+                (void*)(region->base + region->size));
+        zx_status_t status = second_level_pt_.UnmapPages(region->base, region->size / PAGE_SIZE,
+                                                         &unmapped);
+        // Unmap should only fail if an input were invalid
+        ASSERT(status == ZX_OK);
+        allocated_regions_.erase(i);
+        i--;
+    }
+
+    return ZX_ERR_NOT_FOUND;
+}
+
+uint64_t DeviceContext::minimum_contiguity() const {
+    // TODO(teisenbe): Do not hardcode this.
+    return 1ull << 20;
+}
+
+uint64_t DeviceContext::aspace_size() const {
+    // TODO(teisenbe): Do not hardcode this
+    return 1ull << 48;
 }
 
 } // namespace intel_iommu

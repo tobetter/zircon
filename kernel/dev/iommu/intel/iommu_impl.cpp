@@ -752,14 +752,40 @@ zx_status_t IommuImpl::GetOrCreateDeviceContextLocked(uint8_t bus, uint8_t dev_f
     return ctx_table_state->CreateDeviceContext(bus, dev_func, domain_id, context);
 }
 
-uint64_t IommuImpl::minimum_contiguity(uint64_t bus_txn_id) const {
-    // TODO(teisenbe): Discover this from the device context
-    return PAGE_SIZE;
+uint64_t IommuImpl::minimum_contiguity(uint64_t bus_txn_id) {
+    if (!IsValidBusTxnId(bus_txn_id)) {
+        return 0;
+    }
+
+    uint8_t bus, dev_func;
+    decode_bus_txn_id(bus_txn_id, &bus, &dev_func);
+
+    fbl::AutoLock guard(&lock_);
+    DeviceContext* dev;
+    zx_status_t status = GetOrCreateDeviceContextLocked(bus, dev_func, &dev);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    return dev->minimum_contiguity();
 }
 
-uint64_t IommuImpl::aspace_size(uint64_t bus_txn_id) const {
-    // TODO(teisenbe): Discover this from the device context
-    return 1ull << 48;
+uint64_t IommuImpl::aspace_size(uint64_t bus_txn_id) {
+    if (!IsValidBusTxnId(bus_txn_id)) {
+        return 0;
+    }
+
+    uint8_t bus, dev_func;
+    decode_bus_txn_id(bus_txn_id, &bus, &dev_func);
+
+    fbl::AutoLock guard(&lock_);
+    DeviceContext* dev;
+    zx_status_t status = GetOrCreateDeviceContextLocked(bus, dev_func, &dev);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    return dev->aspace_size();
 }
 
 } // namespace intel_iommu

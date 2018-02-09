@@ -9,6 +9,8 @@
 #include <fbl/intrusive_double_list.h>
 #include <fbl/macros.h>
 #include <fbl/unique_ptr.h>
+#include <fbl/vector.h>
+#include <region-alloc/region-alloc.h>
 #include <vm/vm_object.h>
 
 #include "hw.h"
@@ -38,6 +40,9 @@ public:
 
     uint32_t domain_id() const { return domain_id_; }
 
+    uint64_t minimum_contiguity() const;
+    uint64_t aspace_size() const;
+
     // Use the second-level translation table to map the host pages in the given
     // range on |vmo| to the guest's address |*virt_paddr|.  |size| is in bytes.
     // |mapped_len| may be larger than |size|, if |size| was not page-aligned.
@@ -57,6 +62,17 @@ private:
 
     DISALLOW_COPY_ASSIGN_AND_MOVE(DeviceContext);
 
+    // Shared initialization code for the two public Create() methods
+    zx_status_t InitCommon();
+
+    // Specialized mapping routines for dealing with Paged and Physical VMOs
+    zx_status_t SecondLevelMapPaged(const fbl::RefPtr<VmObject>& vmo,
+                                    uint64_t offset, size_t size, uint flags,
+                                    paddr_t* virt_paddr, size_t* mapped_len);
+    zx_status_t SecondLevelMapPhysical(const fbl::RefPtr<VmObject>& vmo,
+                                       uint64_t offset, size_t size, uint flags,
+                                       paddr_t* virt_paddr, size_t* mapped_len);
+
     IommuImpl* const parent_;
     union {
         volatile ds::ExtendedContextEntry* const extended_context_entry_;
@@ -66,6 +82,9 @@ private:
     // Page tables used for translating requests-without-PASID and for nested
     // translation of requests-with-PASID.
     SecondLevelPageTable second_level_pt_;
+    RegionAllocator region_alloc_;
+    // TODO(teisenbe): Use a better datastructure for these...
+    fbl::Vector<fbl::unique_ptr<const RegionAllocator::Region>> allocated_regions_;
 
     const uint8_t bus_;
     const uint8_t dev_func_;

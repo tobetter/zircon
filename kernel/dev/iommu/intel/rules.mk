@@ -20,7 +20,8 @@ MODULE_DEPS := \
 	kernel/arch/x86/page_tables \
 	kernel/dev/pcie \
 	kernel/lib/bitmap \
-	kernel/lib/hwreg \
 	kernel/lib/fbl \
+	kernel/lib/hwreg \
+	kernel/lib/region-alloc \
 
 include make/module.mk
