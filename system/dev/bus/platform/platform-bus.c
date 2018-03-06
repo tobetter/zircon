@@ -30,9 +30,14 @@ static zx_status_t platform_bus_set_protocol(void* ctx, uint32_t proto_id, void*
     case ZX_PROTOCOL_GPIO:
         memcpy(&bus->gpio, protocol, sizeof(bus->gpio));
         break;
-    case ZX_PROTOCOL_I2C:
+    case ZX_PROTOCOL_I2C_DRIVER: {
+        zx_status_t status = platform_i2c_init(bus, (i2c_driver_protocol_t *)protocol);
+        if (status != ZX_OK) {
+            return status;
+         }
         memcpy(&bus->i2c, protocol, sizeof(bus->i2c));
         break;
+    }
     case ZX_PROTOCOL_CLK:
         memcpy(&bus->clk, protocol, sizeof(bus->clk));
         break;

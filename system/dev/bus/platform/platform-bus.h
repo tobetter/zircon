@@ -17,6 +17,9 @@
 #include <sync/completion.h>
 #include <zircon/types.h>
 
+// this struct is local to platform-i2c.c
+typedef struct i2c_driver_channel i2c_driver_channel_t;
+
 // this struct is local to platform-serial.c
 typedef struct serial_port serial_port_t;
 
@@ -34,6 +37,9 @@ typedef struct {
 
     list_node_t devices;    // list of platform_dev_t
     char board_name[ZX_DEVICE_NAME_MAX + 1];
+
+    i2c_driver_channel_t* i2c_channels;
+    uint32_t i2c_channel_count;
 
     serial_port_t* serial_ports;
     uint32_t serial_port_count;
@@ -88,6 +94,11 @@ zx_status_t platform_bus_get_protocol(void* ctx, uint32_t proto_id, void* protoc
 void platform_dev_free(platform_dev_t* dev);
 zx_status_t platform_device_add(platform_bus_t* bus, const pbus_dev_t* dev, uint32_t flags);
 zx_status_t platform_device_enable(platform_dev_t* dev, bool enable);
+
+// platform-i2c.c
+zx_status_t platform_i2c_init(platform_bus_t* bus, i2c_driver_protocol_t* i2c);
+zx_status_t platform_i2c_get_channel(platform_bus_t* bus, uint32_t bus_id, uint16_t address,
+                                     size_t* out_max_transfer_size);
 
 // platform-serial.c
 zx_status_t platform_serial_init(platform_bus_t* bus, serial_driver_protocol_t* serial);

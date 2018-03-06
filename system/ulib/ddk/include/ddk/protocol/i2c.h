@@ -134,4 +134,45 @@ static inline zx_status_t i2c_transact_sync(i2c_channel_t* channel, const void* 
     }
 }
 
+// Low-level protocol for i2c drivers
+typedef void (*i2c_driver_complete_cb)(zx_status_t status, void* cookie);
+
+typedef struct {
+    size_t (*get_channel_count)(void* ctx);
+    zx_status_t (*read)(void* ctx, void* buf, size_t length,
+                        uint32_t bus_id, uint16_t address,
+                        i2c_driver_complete_cb complete_cb, void* cookie);
+    zx_status_t (*write)(void* ctx, const void* buf, size_t length,
+                         uint32_t bus_id, uint16_t address,
+                         i2c_driver_complete_cb complete_cb, void* cookie);
+    zx_status_t (*set_bitrate)(void* ctx, uint32_t bus_id, uint32_t bitrate);
+} i2c_driver_ops_t;
+
+typedef struct {
+    i2c_driver_ops_t* ops;
+    void* ctx;
+} i2c_driver_protocol_t;
+
+static inline size_t i2c_driver_get_channel_count(i2c_driver_protocol_t* i2c) {
+    return i2c->ops->get_channel_count(i2c->ctx);
+}
+
+
+static inline zx_status_t i2c_driver_read(i2c_driver_protocol_t* i2c, void* buf, size_t length,
+                                          uint32_t bus_id, uint16_t address,
+                                          i2c_driver_complete_cb complete_cb, void* cookie) {
+    return i2c->ops->read(i2c->ctx, buf, length, bus_id, address, complete_cb, cookie);
+}
+
+static inline zx_status_t i2c_driver_write(i2c_driver_protocol_t* i2c, const void* buf,
+                                           size_t length, uint32_t bus_id, uint16_t address,
+                                          i2c_driver_complete_cb complete_cb, void* cookie) {
+    return i2c->ops->write(i2c->ctx, buf, length, bus_id, address, complete_cb, cookie);
+}
+
+static inline zx_status_t i2c_driver_set_bitrate(i2c_driver_protocol_t* i2c, uint32_t bus_id,
+                                                 uint32_t bitrate) {
+    return i2c->ops->set_bitrate(i2c->ctx, bus_id, bitrate);
+}
+
 __END_CDECLS;
